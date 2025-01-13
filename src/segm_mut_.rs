@@ -220,6 +220,10 @@ where
             .iter()
             .map(|x| x as *const MaybeUninit<T>)
     }
+
+    fn borrowed_len(&self) -> usize {
+        self.slice_mut_.borrow().len()
+    }
 }
 
 impl<B, T, R> SegmMut<B, T, R>

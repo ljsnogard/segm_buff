@@ -160,6 +160,10 @@ where
             .iter()
             .map(|x| x as *const T)
     }
+
+    fn borrowed_len(&self) -> usize {
+        self.slice_ref_.borrow().len()
+    }
 }
 
 impl<B, T, R> TrBuffSegmRef<T> for SegmRef<B, T, R>
