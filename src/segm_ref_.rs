@@ -48,13 +48,18 @@ where
     }
 
     #[inline]
+    pub fn capacity(&self) -> usize {
+        self.slice_ref_.borrow().len()
+    }
+
+    #[inline]
     pub fn len(&self) -> usize {
-        self.slice_ref_.borrow().len() - self.offset_
+        self.capacity() - self.offset_
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.slice_ref_.borrow().len() == self.offset_
+        self.capacity() == self.offset_
     }
 
     pub fn as_slice(&self) -> &[T] {
@@ -146,10 +151,17 @@ where
 {
     type Item = T;
 
+    #[inline]
+    fn capacity(&self) -> usize {
+        SegmRef::capacity(self)
+    }
+
+    #[inline]
     fn is_empty(&self) -> bool {
         SegmRef::is_empty(self)
     }
 
+    #[inline]
     fn len(&self) -> usize {
         SegmRef::len(self)
     }
@@ -159,10 +171,6 @@ where
             .borrow()
             .iter()
             .map(|x| x as *const T)
-    }
-
-    fn borrowed_len(&self) -> usize {
-        self.slice_ref_.borrow().len()
     }
 }
 

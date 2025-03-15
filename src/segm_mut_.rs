@@ -52,13 +52,18 @@ where
     }
 
     #[inline]
+    pub fn capacity(&self) -> usize {
+        self.slice_mut_.borrow().len()
+    }
+
+    #[inline]
     pub fn len(&self) -> usize {
-        self.slice_mut_.borrow().len() - self.offset_
+        self.capacity() - self.offset_
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.slice_mut_.borrow().len() == self.offset_
+        self.capacity() == self.offset_
     }
 
     pub fn as_slice(&self) -> &[MaybeUninit<T>] {
@@ -205,6 +210,11 @@ where
     type Item = MaybeUninit<T>;
 
     #[inline]
+    fn capacity(&self) -> usize {
+        SegmMut::capacity(self)
+    }
+
+    #[inline]
     fn is_empty(&self) -> bool {
         SegmMut::is_empty(self)
     }
@@ -219,10 +229,6 @@ where
             .borrow()
             .iter()
             .map(|x| x as *const MaybeUninit<T>)
-    }
-
-    fn borrowed_len(&self) -> usize {
-        self.slice_mut_.borrow().len()
     }
 }
 
