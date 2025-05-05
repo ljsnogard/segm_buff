@@ -13,3 +13,4 @@ readme = "README.md"
 
 [dependencies]
 abs_buff = { git = "https://github.com/ljsnogard/abs_buff.git", branch = "dev/0.2.0" }
+abs_iter = { git = "https://github.com/ljsnogard/abs_iter.git", branch = "main" }

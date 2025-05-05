@@ -1,37 +1,32 @@
 ﻿use core::{
     borrow::{Borrow, BorrowMut},
-    cmp,
-    marker::{PhantomData, PhantomPinned},
+    marker::PhantomData,
     mem::MaybeUninit,
     ops::{Deref, DerefMut},
     ptr::NonNull,
 };
 
-use abs_buff::{TrBuffSegmMut, TrBuffSegmRef, TrBuffSegmView};
-
-use super::{
-    reclaim_::BuffSegmReclaim,
-    NoReclaim, TrReclaim,
-};
+use abs_buff::{Demand, TrBuffSegmMut, TrBuffSegmView, TrOutput};
+use abs_iter::{TrItemsMutView, TrItemsRefView};
+use super::forward_::{NoForward, IncrConsumed, TrForward};
 
 /// The rented slice for tx of the [RingBuffer](crate::ring_buffer::RingBuffer)
 #[repr(C)]
-pub struct SegmMut<B, T, R>
+pub struct SegmMut<B, T, F>
 where
     B: BorrowMut<[MaybeUninit<T>]>,
-    R: TrReclaim<MaybeUninit<T>>,
+    F: TrForward,
 {
-    _mark_t_: PhantomData<[T]>,
-    _pinned_: PhantomPinned,
-    offset_: usize,
-    reclaim_: Option<R>,
+    _using_t_: PhantomData<[T]>,
+    consumed_: usize,
+    forward_: F,
     slice_mut_: B,
 }
 
-impl<B, T, R> SegmMut<B, T, R>
+impl<B, T, F> SegmMut<B, T, F>
 where
     B: BorrowMut<[MaybeUninit<T>]>,
-    R: TrReclaim<MaybeUninit<T>>,
+    F: TrForward,
 {
     /// Create by borrowing a mut slice from an implicit source. And the items
     /// of this mut slice will be returned back to or moved out from the source 
@@ -41,12 +36,11 @@ where
     /// 
     /// - `reclaim` should be capable of semantically move item out when this
     ///     slice `into_iter`
-    pub const fn new(slice_mut: B, reclaim: Option<R>) -> Self {
+    pub const fn new(slice_mut: B, forward: F) -> Self {
         SegmMut {
-            _mark_t_: PhantomData,
-            _pinned_: PhantomPinned,
-            offset_: 0usize,
-            reclaim_: reclaim,
+            _using_t_: PhantomData,
+            consumed_: 0usize,
+            forward_: forward,
             slice_mut_: slice_mut,
         }
     }
@@ -58,57 +52,46 @@ where
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.capacity() - self.offset_
+        self.capacity() - self.consumed_
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.capacity() == self.offset_
+        self.capacity() == self.consumed_
     }
 
     pub fn as_slice(&self) -> &[MaybeUninit<T>] {
         let slice: &[MaybeUninit<T>] = self.slice_mut_.borrow();
-        &slice[self.offset_..]
+        &slice[self.consumed_..]
     }
 
     pub fn as_slice_mut(&mut self) -> &mut [MaybeUninit<T>] {
         let slice: &mut [MaybeUninit<T>] = self.slice_mut_.borrow_mut();
-        &mut slice[self.offset_..]
+        &mut slice[self.consumed_..]
     }
 
-    pub fn dump_from<S: TrBuffSegmRef<T>>(
-        &mut self,
-        source: &mut S,
-    ) -> usize {
-        TrBuffSegmMut::dump_from_segm(self, source)
-    }
-
-    pub fn take_segm_mut(
-        &mut self,
-        length: usize,
-    ) -> SegmMut<&mut [MaybeUninit<T>], T, BuffSegmReclaim> {
+    pub fn take_segm_mut<'f>(
+        &'f mut self,
+        length: Demand<usize>,
+    ) -> Option<SegmMut<&'f mut [MaybeUninit<T>], T, IncrConsumed>> {
+        let Option::Some(size) = length.most_with(self.len()) else {
+            return Option::None
+        };
         unsafe {
             let mut this_ptr = NonNull::new_unchecked(self);
             let slice = this_ptr.as_mut().as_slice_mut();
-            let size = cmp::min(length, slice.len());
             let slice = &mut slice[..size];
-            let offset_ptr =
-                NonNull::new_unchecked(&mut this_ptr.as_mut().offset_);
-            let reclaim = Option::Some(BuffSegmReclaim::new(offset_ptr));
-            SegmMut::<&mut [MaybeUninit<T>], T, BuffSegmReclaim>
-                ::new(slice, reclaim)
+            let forward = IncrConsumed::new(&mut self.consumed_);
+            Option::Some(SegmMut::new(slice, forward))
         }
     }
 
-    pub fn clone_from(&mut self, source: &[T]) -> usize
-    where
-        T: Clone,
-    {
-        TrBuffSegmMut::clone_from_slice(self, source)
+    pub fn as_output(&mut self) -> impl TrOutput<T> {
+        TrBuffSegmMut::as_output(self)
     }
 }
 
-impl<B, T> SegmMut<B, T, NoReclaim>
+impl<B, T> SegmMut<B, T, NoForward>
 where
     B: BorrowMut<[MaybeUninit<T>]>,
 {
@@ -116,28 +99,25 @@ where
     ///
     /// ## Safety
     /// - `slice` must be managed by the source buffer;
-    pub const fn no_reclaim(slice_mut: B) -> Self {
-        SegmMut::new(slice_mut, Option::None)
+    pub const fn no_forward(slice_mut: B) -> Self {
+        SegmMut::new(slice_mut, NoForward::new())
     }
 }
 
-impl<B, T, R> Drop for SegmMut<B, T, R>
+impl<B, T, F> Drop for SegmMut<B, T, F>
 where
     B: BorrowMut<[MaybeUninit<T>]>,
-    R: TrReclaim<MaybeUninit<T>>,
+    F: TrForward,
 {
     fn drop(&mut self) {
-        let Option::Some(mut r) = self.reclaim_.take() else {
-            return;
-        };
-        r.reclaim(self)
+        self.forward_.forward(self.capacity())
     }
 }
 
-impl<B, T, R> Borrow<[MaybeUninit<T>]> for SegmMut<B, T, R>
+impl<B, T, F> Borrow<[MaybeUninit<T>]> for SegmMut<B, T, F>
 where
     B: BorrowMut<[MaybeUninit<T>]>,
-    R: TrReclaim<MaybeUninit<T>>,
+    F: TrForward,
 {
     #[inline]
     fn borrow(&self) -> &[MaybeUninit<T>] {
@@ -145,10 +125,10 @@ where
     }
 }
 
-impl<B, T, R> BorrowMut<[MaybeUninit<T>]> for SegmMut<B, T, R>
+impl<B, T, F> BorrowMut<[MaybeUninit<T>]> for SegmMut<B, T, F>
 where
     B: BorrowMut<[MaybeUninit<T>]>,
-    R: TrReclaim<MaybeUninit<T>>,
+    F: TrForward,
 {
     #[inline]
     fn borrow_mut(&mut self) -> &mut [MaybeUninit<T>] {
@@ -156,10 +136,10 @@ where
     }
 }
 
-impl<B, T, R> AsRef<[MaybeUninit<T>]> for SegmMut<B, T, R>
+impl<B, T, F> AsRef<[MaybeUninit<T>]> for SegmMut<B, T, F>
 where
     B: BorrowMut<[MaybeUninit<T>]>,
-    R: TrReclaim<MaybeUninit<T>>,
+    F: TrForward,
 {
     #[inline]
     fn as_ref(&self) -> &[MaybeUninit<T>] {
@@ -167,10 +147,10 @@ where
     }
 }
 
-impl<B, T, R> AsMut<[MaybeUninit<T>]> for SegmMut<B, T, R>
+impl<B, T, F> AsMut<[MaybeUninit<T>]> for SegmMut<B, T, F>
 where
     B: BorrowMut<[MaybeUninit<T>]>,
-    R: TrReclaim<MaybeUninit<T>>,
+    F: TrForward,
 {
     #[inline]
     fn as_mut(&mut self) -> &mut [MaybeUninit<T>] {
@@ -178,10 +158,10 @@ where
     }
 }
 
-impl<B, T, R> Deref for SegmMut<B, T, R>
+impl<B, T, F> Deref for SegmMut<B, T, F>
 where
     B: BorrowMut<[MaybeUninit<T>]>,
-    R: TrReclaim<MaybeUninit<T>>,
+    F: TrForward,
 {
     type Target = [MaybeUninit<T>];
 
@@ -191,10 +171,10 @@ where
     }
 }
 
-impl<B, T, R> DerefMut for SegmMut<B, T, R>
+impl<B, T, F> DerefMut for SegmMut<B, T, F>
 where
     B: BorrowMut<[MaybeUninit<T>]>,
-    R: TrReclaim<MaybeUninit<T>>,
+    F: TrForward,
 {
     #[inline]
     fn deref_mut(&mut self) -> &mut [MaybeUninit<T>] {
@@ -202,10 +182,40 @@ where
     }
 }
 
-impl<B, T, R> TrBuffSegmView for SegmMut<B, T, R>
+impl<B, T, F> TrItemsRefView for SegmMut<B, T, F>
 where
     B: BorrowMut<[MaybeUninit<T>]>,
-    R: TrReclaim<MaybeUninit<T>>,
+    F: TrForward,
+{
+    type Item = MaybeUninit<T>;
+    type View<'view> = &'view MaybeUninit<T>
+    where
+        Self: 'view;
+
+    fn items_ref_view(&self) -> impl Iterator<Item = Self::View<'_>> {
+        self.as_slice().iter()
+    }
+}
+
+impl<B, T, F> TrItemsMutView for SegmMut<B, T, F>
+where
+    B: BorrowMut<[MaybeUninit<T>]>,
+    F: TrForward,
+{
+    type Item = MaybeUninit<T>;
+    type View<'view> = &'view mut MaybeUninit<T>
+    where
+        Self: 'view;
+
+    fn items_mut_view(&mut self) -> impl Iterator<Item = Self::View<'_>> {
+        self.as_slice_mut().iter_mut()
+    }
+}
+
+impl<B, T, F> TrBuffSegmView for SegmMut<B, T, F>
+where
+    B: BorrowMut<[MaybeUninit<T>]>,
+    F: TrForward,
 {
     type Item = MaybeUninit<T>;
 
@@ -232,30 +242,41 @@ where
     }
 }
 
-impl<B, T, R> SegmMut<B, T, R>
+impl<B, T, F> TrBuffSegmMut<T> for SegmMut<B, T, F>
 where
     B: BorrowMut<[MaybeUninit<T>]>,
-    T: Copy,
-    R: TrReclaim<MaybeUninit<T>>,
+    F: TrForward,
 {
-    /// A convenient wrapper around [copy_from_slice](<[T]>::copy_from_slice)
-    pub fn copy_from_slice(&mut self, src: &[T]) {
-        let slice = unsafe {
-            let p = self.deref_mut() as *mut [MaybeUninit<T>] as *mut [T];
-            &mut *p
-        };
-        slice.copy_from_slice(src);
-    }
-}
+    type Slice<'a> = &'a mut [MaybeUninit<T>]
+    where
+        T: 'a,
+        Self: 'a;
 
-impl<B, T, R> TrBuffSegmMut<T> for SegmMut<B, T, R>
-where
-    B: BorrowMut<[MaybeUninit<T>]>,
-    R: TrReclaim<MaybeUninit<T>>,
-{
+    type Segm<'a> = SegmMut<&'a mut [MaybeUninit<T>], T, IncrConsumed>
+    where
+        T: 'a,
+        Self: 'a;
+
     #[inline]
-    fn take_segm_mut(&mut self, length: usize) -> impl TrBuffSegmMut<T> {
+    fn take_segm_mut<'f>(
+        &'f mut self,
+        length: Demand<usize>,
+    ) -> Option<Self::Segm<'f>> {
         SegmMut::take_segm_mut(self, length)
+    }
+
+    fn iter_slices<'a>(&'a mut self) -> impl IntoIterator<Item = Self::Slice<'a>>
+    where
+        T: 'a,
+    {
+        let opt = if self.is_empty() {
+            Option::None
+        } else {
+            let slice_mut: &mut [MaybeUninit<T>] = self.slice_mut_.borrow_mut();
+            let slice = &mut slice_mut[self.consumed_..];
+            Option::Some(slice)
+        };
+        opt.into_iter()
     }
 }
 
@@ -263,7 +284,7 @@ where
 mod tests_ {
     use core::mem::MaybeUninit;
 
-    use super::SegmMut;
+    use super::{Demand, SegmMut};
 
     #[test]
     fn segm_len_should_eq_as_slice_len() {
@@ -272,20 +293,24 @@ mod tests_ {
         for (u, x) in buff.iter_mut().enumerate() {
             let _ = *x.write(u);
         }
-        let mut segm = SegmMut::no_reclaim(buff.as_mut_slice());
+        let mut segm = SegmMut::no_forward(buff.as_mut_slice());
         let slice = segm.as_slice();
         assert_eq!(segm.len(), ARR_SIZE);
         assert_eq!(slice.len(), segm.len());
 
         const SLICE_LEN: usize = ARR_SIZE >> 1;
-        let taken_slice = segm.take_segm_mut(SLICE_LEN);
+        let Option::Some(taken_slice) = segm.take_segm_mut(Demand::at_most(SLICE_LEN)) else {
+            panic!()
+        };
         for (u, x) in taken_slice.as_ref().iter().enumerate() {
             assert_eq!(unsafe { x.assume_init_read() }, u)
         }
         drop(taken_slice);
         assert_eq!(segm.len(), ARR_SIZE - SLICE_LEN);
 
-        let taken_slice = segm.take_segm_mut(ARR_SIZE);
+        let Option::Some(taken_slice) = segm.take_segm_mut(Demand::at_most(ARR_SIZE)) else {
+            panic!()
+        };
         assert_eq!(taken_slice.len(), ARR_SIZE- SLICE_LEN);
         for (u, x) in taken_slice.as_ref().iter().enumerate() {
             assert_eq!(unsafe { x.assume_init_read() }, u + SLICE_LEN)

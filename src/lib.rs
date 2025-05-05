@@ -5,16 +5,19 @@
 #[cfg(test)]
 extern crate std;
 
-mod reclaim_;
+mod forward_;
 mod segm_mut_;
 mod segm_ref_;
+mod segm_seq_;
 
-pub use reclaim_::{BuffSegmReclaim, NoReclaim, TrReclaim};
+pub use forward_::{NoForward, IncrConsumed, TrForward};
 pub use segm_mut_::SegmMut;
 pub use segm_ref_::SegmRef;
+pub use segm_seq_::SegmSeq;
 
 pub mod x_deps {
     pub use abs_buff;
+    pub use abs_iter;
 
     pub use abs_buff::x_deps::abs_sync;
 }
