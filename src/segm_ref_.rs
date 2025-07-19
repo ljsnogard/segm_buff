@@ -1,42 +1,41 @@
 ﻿use core::{
     borrow::Borrow,
-    iter::Iterator,
+    iter::IntoIterator,
     marker::PhantomData,
-    ops::Deref,
+    ops::{Deref, Try},
     ptr::NonNull,
 };
 
-use abs_buff::{Demand, TrBuffSegmRef, TrBuffSegmView};
-use abs_iter::TrItemsRefView;
+use abs_buff::{
+    x_deps::abs_iter,
+    Demand, TrBuffSegmRef, TrBuffSegmView,
+};
+use abs_iter::{TrItemsRefView, TrAsSlice};
 
-use crate::NoForward;
+use super::forward_::{IncrConsumed, NoForward};
 
-use super::forward_::{IncrConsumed, TrForward};
-
-/// A wrapper around a slice borrowed from a buffer and its reclaim function.
-/// Designed for [RingBuffer](crate::ring_buffer::RingBuffer) but capable of
-/// being a simple stream buffer to support the consuming semantics.
+/// Wraps a single slice into a buffer (`TrBuffSegmRef`).
 #[repr(C)]
 pub struct SegmRef<B, T, F>
 where
     B: Borrow<[T]>,
-    F: TrForward,
+    F: FnOnce(usize),
 {
     _using_t_: PhantomData<[T]>,
     consumed_: usize,
-    forward_: F,
+    forward_: Option<F>,
     slice_ref_: B,
 }
 
 impl<B, T, F> SegmRef<B, T, F>
 where
     B: Borrow<[T]>,
-    F: TrForward,
+    F: FnOnce(usize),
 {
     /// Create by borrowing a slice from an implicit source. And the items of 
     /// this slice will be returned back to or moved out of the source by
     /// `reclaim`.
-    pub const fn new(slice: B, forward: F) -> Self {
+    pub const fn new(slice: B, forward: Option<F>) -> Self {
         SegmRef {
             _using_t_: PhantomData,
             consumed_: 0usize,
@@ -52,7 +51,7 @@ where
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.capacity() - self.consumed_
+        self.as_slice().len()
     }
 
     #[inline]
@@ -66,19 +65,34 @@ where
         &slice[self.consumed_..]
     }
 
+    pub fn iter_slices<'a>(
+        &'a self,
+    ) -> impl IntoIterator<Item: TrAsSlice<Elem = T>>
+    where
+        T: 'a
+    {
+        let opt = if self.is_empty() {
+            Option::None
+        } else {
+            let slice_ref: &[T] = self.slice_ref_.borrow();
+            let slice = &slice_ref[self.consumed_..];
+            Option::Some(slice)
+        };
+        opt.into_iter()
+    }
+
     pub fn take_segm_ref<'f>(
         &'f mut self,
         length: Demand<usize>,
     ) -> Option<SegmRef<&'f [T], T, IncrConsumed>> {
-        let Option::Some(size) = length.most_with(self.len()) else {
-            return Option::None;
-        };
+        let demand = length.narrow_from_most(self.len())?;
+        let size = demand.most().cloned()?;
         unsafe {
             let this_ptr = NonNull::new_unchecked(self);
             let slice = this_ptr.as_ref().as_slice();
             let slice = &slice[..size];
             let forward = IncrConsumed::new(&mut self.consumed_);
-            Option::Some(SegmRef::new(slice, forward))
+            Option::Some(SegmRef::new(slice, Option::Some(forward)))
         }
     }
 }
@@ -90,24 +104,26 @@ where
     /// Create by borrowing a slice from an implicit source but no reclaim 
     #[inline]
     pub const fn no_reclaim(slice: B) -> Self {
-        SegmRef::new(slice, NoForward::new())
+        SegmRef::new(slice, Option::Some(NoForward::new()))
     }
 }
 
 impl<B, T, F> Drop for SegmRef<B, T, F>
 where
     B: Borrow<[T]>,
-    F: TrForward,
+    F: FnOnce(usize),
 {
     fn drop(&mut self) {
-        self.forward_.forward(self.capacity());
+        if let Option::Some(f) = self.forward_.take() {
+            f(self.capacity());
+        }
     }
 }
 
 impl<B, T, F> Deref for SegmRef<B, T, F>
 where
     B: Borrow<[T]>,
-    F: TrForward,
+    F: FnOnce(usize),
 {
     type Target = [T];
 
@@ -120,7 +136,7 @@ where
 impl<B, T, F> Borrow<[T]> for SegmRef<B, T, F>
 where
     B: Borrow<[T]>,
-    F: TrForward,
+    F: FnOnce(usize),
 {
     #[inline]
     fn borrow(&self) -> &[T] {
@@ -131,7 +147,7 @@ where
 impl<B, T, F> AsRef<[T]> for SegmRef<B, T, F>
 where
     B: Borrow<[T]>,
-    F: TrForward,
+    F: FnOnce(usize),
 {
     #[inline]
     fn as_ref(&self) -> &[T] {
@@ -139,17 +155,22 @@ where
     }
 }
 
+impl<B, T, F> TrAsSlice for SegmRef<B, T, F>
+where
+    B: Borrow<[T]>,
+    F: FnOnce(usize),
+{
+    type Elem = T;
+}
+
 impl<B, T, F> TrItemsRefView for SegmRef<B, T, F>
 where
     B: Borrow<[T]>,
-    F: TrForward,
+    F: FnOnce(usize),
 {
     type Item = T;
-    type View<'view> = &'view T
-    where
-        Self: 'view;
 
-    fn items_ref_view(&self) -> impl Iterator<Item = Self::View<'_>> {
+    fn items_ref_view(&self) -> impl IntoIterator<Item: Borrow<Self::Item>> {
         self.as_slice().iter()
     }
 }
@@ -157,7 +178,7 @@ where
 impl<B, T, F> TrBuffSegmView for SegmRef<B, T, F>
 where
     B: Borrow<[T]>,
-    F: TrForward,
+    F: FnOnce(usize),
 {
     type Item = T;
 
@@ -172,54 +193,24 @@ where
     }
 
     #[inline]
-    fn len(&self) -> usize {
-        SegmRef::len(self)
-    }
-
-    fn iter_ptr(&self) -> impl Iterator<Item = *const Self::Item> {
-        self.slice_ref_
-            .borrow()
-            .iter()
-            .map(|x| x as *const T)
+    fn iter_slices(
+        &self,
+    ) -> impl IntoIterator<Item: TrAsSlice<Elem = Self::Item>> {
+        SegmRef::iter_slices(self)
     }
 }
 
 impl<B, T, F> TrBuffSegmRef<T> for SegmRef<B, T, F>
 where
     B: Borrow<[T]>,
-    F: TrForward,
+    F: FnOnce(usize),
 {
-    type Slice<'a> = &'a [T]
-    where
-        T: 'a,
-        Self: 'a;
-
-
-    type Segm<'a> = SegmRef<&'a [T], T, IncrConsumed>
-    where
-        T: 'a,
-        Self: 'a;
-
     #[inline]
-    fn take_segm_ref<'f>(
-        &'f mut self,
+    fn take_segm_ref(
+        &mut self,
         length: Demand<usize>,
-    ) -> Option<Self::Segm<'f>> {
+    ) -> impl Try<Output: TrBuffSegmRef<T>> {
         SegmRef::take_segm_ref(self, length)
-    }
-
-    fn iter_slices<'a>(&'a mut self) -> impl IntoIterator<Item = Self::Slice<'a>>
-    where
-        T: 'a
-    {
-        let opt = if self.is_empty() {
-            Option::None
-        } else {
-            let slice_ref: &[T] = self.slice_ref_.borrow();
-            let slice = &slice_ref[self.consumed_..];
-            Option::Some(slice)
-        };
-        opt.into_iter()
     }
 }
 
@@ -240,7 +231,7 @@ mod tests_ {
         assert_eq!(slice.len(), buff.len());
 
         const SLICE_LEN: usize = ARR_SIZE >> 1;
-        let Option::Some(taken_slice) = segm.take_segm_ref(Demand::at_most(SLICE_LEN)) else {
+        let Option::Some(taken_slice) = segm.take_segm_ref(Demand::exactly(SLICE_LEN)) else {
             panic!()
         };
         for (u, x) in taken_slice.as_ref().iter().enumerate() {

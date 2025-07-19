@@ -1,10 +1,5 @@
 ﻿use core::ptr::NonNull;
 
-/// To receive the message about the amount of consumed buffer.
-pub trait TrForward {
-    fn forward(&mut self, consumed: usize);
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoForward;
 
@@ -12,16 +7,13 @@ impl NoForward {
     pub const fn new() -> Self {
         NoForward
     }
-
-    pub fn forward(&mut self, consumed: usize) {
-        let _ = consumed;
-    }
 }
 
-impl TrForward for NoForward {
-    #[inline]
-    fn forward(&mut self, consumed: usize) {
-        NoForward::forward(self, consumed);
+impl FnOnce<(usize,)> for NoForward {
+    type Output = ();
+
+    extern "rust-call" fn call_once(self, args: (usize,)) -> Self::Output {
+        let _ = args;
     }
 }
 
@@ -34,7 +26,7 @@ impl IncrConsumed {
         IncrConsumed(unsafe { NonNull::new_unchecked(consumed) })
     }
 
-    pub fn forward(&mut self, consumed: usize) {
+    fn forward(mut self, consumed: usize) {
         unsafe {
             let c_mut = self.0.as_mut();
             *c_mut += consumed;
@@ -42,9 +34,10 @@ impl IncrConsumed {
     }
 }
 
-impl TrForward for IncrConsumed {
-    #[inline]
-    fn forward(&mut self, consumed: usize) {
-        IncrConsumed::forward(self, consumed);
+impl FnOnce<(usize,)> for IncrConsumed {
+    type Output = ();
+
+    extern "rust-call" fn call_once(self, args: (usize,)) -> Self::Output {
+        IncrConsumed::forward(self, args.0);
     }
 }
