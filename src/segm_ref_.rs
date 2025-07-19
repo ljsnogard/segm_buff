@@ -83,10 +83,10 @@ where
 
     pub fn take_segm_ref<'f>(
         &'f mut self,
-        length: Demand<usize>,
+        length: &Demand<usize>,
     ) -> Option<SegmRef<&'f [T], T, IncrConsumed>> {
-        let demand = length.narrow_from_most(self.len())?;
-        let size = demand.most().cloned()?;
+        let demand = length.narrow_from_max(self.len())?;
+        let size = demand.max().cloned()?;
         unsafe {
             let this_ptr = NonNull::new_unchecked(self);
             let slice = this_ptr.as_ref().as_slice();
@@ -208,7 +208,7 @@ where
     #[inline]
     fn take_segm_ref(
         &mut self,
-        length: Demand<usize>,
+        length: &Demand<usize>,
     ) -> impl Try<Output: TrBuffSegmRef<T>> {
         SegmRef::take_segm_ref(self, length)
     }
@@ -240,7 +240,7 @@ mod tests_ {
         drop(taken_slice);
         assert_eq!(segm.len(), buff.len() - SLICE_LEN);
 
-        let Option::Some(taken_slice) = segm.take_segm_ref(Demand::at_most(ARR_SIZE)) else {
+        let Option::Some(taken_slice) = segm.take_segm_ref(Demand::with_max(ARR_SIZE)) else {
             panic!()
         };
         assert_eq!(taken_slice.len(), buff.len() - SLICE_LEN);

@@ -106,10 +106,10 @@ where
 
     pub fn take_segm_mut<'f>(
         &'f mut self,
-        length: Demand<usize>,
+        length: &Demand<usize>,
     ) -> Option<SegmMut<&'f mut [MaybeUninit<T>], T, IncrConsumed>> {
-        let demand = length.narrow_from_most(self.len())?;
-        let size = demand.most().cloned()?;
+        let demand = length.narrow_from_max(self.len())?;
+        let size = demand.max().cloned()?;
         unsafe {
             let mut this_ptr = NonNull::new_unchecked(self);
             let slice = this_ptr.as_mut().as_slice_mut();
@@ -300,7 +300,7 @@ where
     #[inline]
     fn take_segm_mut(
         &mut self, 
-        length: Demand<usize>,
+        length: &Demand<usize>,
     ) -> impl Try<Output: TrBuffSegmMut<T>> {
         SegmMut::take_segm_mut(self, length)
     }
@@ -334,7 +334,7 @@ mod tests_ {
         drop(taken_slice);
         assert_eq!(segm.len(), ARR_SIZE - SLICE_LEN);
 
-        let Option::Some(taken_slice) = segm.take_segm_mut(Demand::at_most(ARR_SIZE)) else {
+        let Option::Some(taken_slice) = segm.take_segm_mut(Demand::with_max(ARR_SIZE)) else {
             panic!()
         };
         assert_eq!(taken_slice.len(), ARR_SIZE- SLICE_LEN);
