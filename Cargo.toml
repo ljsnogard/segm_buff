@@ -1,6 +1,6 @@
 [package]
 name = "segm_buff"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 
 authors = ["lino <lino_snsalias@outlook.com>"]
@@ -12,4 +12,4 @@ license = "MIT/Apache-2.0"
 readme = "README.md"
 
 [dependencies]
-abs_buff = { git = "https://github.com/ljsnogard/abs_buff.git", branch = "dev/0.2.0" }
+abs_buff = { git = "https://github.com/ljsnogard/abs_buff.git", branch = "dev/0.3.0" }

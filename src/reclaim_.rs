@@ -1,4 +1,7 @@
-﻿use core::ptr::NonNull;
+﻿use core::{
+    ops::AddAssign,
+    ptr::NonNull,
+};
 
 use abs_buff::TrBuffSegmView;
 
@@ -16,19 +19,27 @@ impl<T> TrReclaim<T> for NoReclaim {
     }
 }
 
-pub struct BuffSegmReclaim(NonNull<usize>);
+pub struct SegmSelfReclaim(NonNull<usize>);
 
-impl BuffSegmReclaim {
+impl SegmSelfReclaim {
     #[inline]
-    pub(super) const unsafe fn new(offset_ptr: NonNull<usize>) -> Self {
-        BuffSegmReclaim(offset_ptr)
+    pub(super) const fn new(offset_ptr: NonNull<usize>) -> Self {
+        SegmSelfReclaim(offset_ptr)
     }
 }
 
-impl<T> TrReclaim<T> for BuffSegmReclaim {
+impl<T> TrReclaim<T> for SegmSelfReclaim {
     #[inline]
     fn reclaim<S: TrBuffSegmView<Item = T>>(&mut self, s: &mut S) {
-        let offset_mut = unsafe { self.0.as_mut() };
-        *offset_mut += s.len()
+        let c = s.capacity();
+        #[cfg(test)]
+        {
+            let offset_ptr = self.0.as_ptr();
+            std::println!("SegmSelfReclaim::reclaim: [{:p}] {c}", offset_ptr);
+        }
+        unsafe {
+            let offset_mut: &mut usize = self.0.as_mut();
+            offset_mut.add_assign(c);
+        }
     }
 }

@@ -1,15 +1,14 @@
 ﻿use core::{
     borrow::Borrow,
-    cmp,
     marker::{PhantomData, PhantomPinned},
-    ops::Deref,
+    ops::{Deref, Try, RangeBounds},
     ptr::NonNull,
 };
 
-use abs_buff::{TrBuffSegmRef, TrBuffSegmView};
+use abs_buff::{Demand, TrBuffSegmRef, TrBuffSegmView};
 
 use super::{
-    reclaim_::BuffSegmReclaim,
+    reclaim_::SegmSelfReclaim,
     NoReclaim, TrReclaim,
 };
 
@@ -17,24 +16,24 @@ use super::{
 /// Designed for [RingBuffer](crate::ring_buffer::RingBuffer) but capable of
 /// being a simple stream buffer to support the consuming semantics.
 #[repr(C)]
-pub struct SegmRef<B, T, R>
+pub struct SegmRef<'b, B, T, R>
 where
     B: Borrow<[T]>,
     R: TrReclaim<T>,
 {
-    _mark_t_: PhantomData<[T]>,
+    _mark_t_: PhantomData<&'b [T]>,
     _pinned_: PhantomPinned,
     offset_: usize,
     reclaim_: Option<R>,
     slice_ref_: B,
 }
 
-impl<B, T, R> SegmRef<B, T, R>
+impl<B, T, R> SegmRef<'_, B, T, R>
 where
     B: Borrow<[T]>,
     R: TrReclaim<T>,
 {
-    /// Create by borrowing a slice from an implicit source. And the items of 
+    /// Create by borrowing a slice from an implicit source. And the items of
     /// this slice will be returned back to or moved out of the source by
     /// `reclaim`.
     pub const fn new(slice: B, reclaim: Option<R>) -> Self {
@@ -48,8 +47,8 @@ where
     }
 
     #[inline]
-    pub fn len(&self) -> usize {
-        self.slice_ref_.borrow().len() - self.offset_
+    pub fn capacity(&self) -> usize {
+        self.slice_ref_.borrow().len()
     }
 
     #[inline]
@@ -58,40 +57,59 @@ where
     }
 
     pub fn as_slice(&self) -> &[T] {
+        #[cfg(test)]
+        {
+            let p = self as *const Self;
+            std::println!("[{:p}]SegmRef::as_slice_mut, self.offset_: {}", p,  self.offset_);
+        }
         let slice: &[T] = self.slice_ref_.borrow();
-        debug_assert!(self.offset_ <= slice.len());
         &slice[self.offset_..]
     }
 
-    pub fn take_segm_ref(
-        &mut self,
-        length: usize,
-    ) -> SegmRef<&[T], T, BuffSegmReclaim> {
-        unsafe {
-            let mut this_ptr = NonNull::new_unchecked(self);
-            let slice = this_ptr.as_ref().as_slice();
-            let size = cmp::min(length, slice.len());
-            let slice = &slice[..size];
-            let offset_ptr =
-                NonNull::new_unchecked(&mut this_ptr.as_mut().offset_);
-            let reclaim = Option::Some(BuffSegmReclaim::new(offset_ptr));
-            SegmRef::<&[T], T, BuffSegmReclaim>::new(slice, reclaim)
+    pub fn iter_slices(&self) -> Option<&[T]> {
+        if self.is_empty() {
+            Option::None
+        } else {
+            Option::Some(self.as_slice())
         }
+    }
+
+    pub fn take_segm_ref<'a>(
+        &'a mut self,
+        length: &impl RangeBounds<usize>,
+    ) -> Option<SegmRef<'a, &'a [T], T, SegmSelfReclaim>> {
+        let Result::Ok(demand) = Demand::try_from_usize_range(length) else {
+            return Option::None
+        };
+        if self.is_empty() {
+            return Option::None
+        };
+        debug_assert!(self.as_slice().len() >= 1usize);
+        let offset_ptr = unsafe {
+            // self.offset_ is to be update only during drop, where no race should happen.
+            NonNull::new_unchecked(&mut self.offset_ as *mut usize)
+        };
+        let available = Demand::less_than(self.as_slice().len());
+        let compromised = demand.compromise(&available)?;
+        let len = compromised.len();
+        let dst = &self.as_slice()[..len];
+        let reclaim = SegmSelfReclaim::new(offset_ptr);
+        Option::Some(SegmRef::new(dst, Option::Some(reclaim)))
     }
 }
 
-impl<B, T> SegmRef<B, T, NoReclaim>
+impl<B, T> SegmRef<'_, B, T, NoReclaim>
 where
     B: Borrow<[T]>,
 {
-    /// Create by borrowing a slice from an implicit source but no reclaim 
+    /// Create by borrowing a slice from an implicit source but no reclaim
     #[inline]
     pub const fn no_reclaim(slice: B) -> Self {
         SegmRef::new(slice, Option::None)
     }
 }
 
-impl<B, T, R> Drop for SegmRef<B, T, R>
+impl<B, T, R> Drop for SegmRef<'_, B, T, R>
 where
     B: Borrow<[T]>,
     R: TrReclaim<T>,
@@ -100,11 +118,13 @@ where
         let Option::Some(mut r) = self.reclaim_.take() else {
             return;
         };
-        r.reclaim(self)
+        #[cfg(test)]std::println!("[{:p}]SegmRef::drop, before reclaim, self.offset_: {}", self as *mut Self, self.offset_);
+        r.reclaim(self);
+        #[cfg(test)]std::println!("[{:p}]SegmRef::drop, after reclaim, self.offset_: {}", self as *mut Self, self.offset_);
     }
 }
 
-impl<B, T, R> Deref for SegmRef<B, T, R>
+impl<B, T, R> Deref for SegmRef<'_, B, T, R>
 where
     B: Borrow<[T]>,
     R: TrReclaim<T>,
@@ -117,7 +137,7 @@ where
     }
 }
 
-impl<B, T, R> Borrow<[T]> for SegmRef<B, T, R>
+impl<B, T, R> Borrow<[T]> for SegmRef<'_, B, T, R>
 where
     B: Borrow<[T]>,
     R: TrReclaim<T>,
@@ -128,7 +148,7 @@ where
     }
 }
 
-impl<B, T, R> AsRef<[T]> for SegmRef<B, T, R>
+impl<B, T, R> AsRef<[T]> for SegmRef<'_, B, T, R>
 where
     B: Borrow<[T]>,
     R: TrReclaim<T>,
@@ -139,7 +159,7 @@ where
     }
 }
 
-impl<B, T, R> TrBuffSegmView for SegmRef<B, T, R>
+impl<B, T, R> TrBuffSegmView for SegmRef<'_, B, T, R>
 where
     B: Borrow<[T]>,
     R: TrReclaim<T>,
@@ -150,31 +170,38 @@ where
         SegmRef::is_empty(self)
     }
 
-    fn len(&self) -> usize {
-        SegmRef::len(self)
+    fn capacity(&self) -> usize {
+        SegmRef::capacity(self)
     }
 
-    fn iter_ptr(&self) -> impl Iterator<Item = *const Self::Item> {
-        self.slice_ref_
-            .borrow()
-            .iter()
-            .map(|x| x as *const T)
+    /// Iterate the unconsumed parts of the segment slice by slice.
+    fn iter_slices<'a>(
+        &'a self,
+    ) -> impl IntoIterator<Item: 'a + AsRef<[Self::Item]>> {
+        SegmRef::iter_slices(self)
     }
 }
 
-impl<B, T, R> TrBuffSegmRef<T> for SegmRef<B, T, R>
+impl<B, T, R> TrBuffSegmRef<T> for SegmRef<'_, B, T, R>
 where
     B: Borrow<[T]>,
     R: TrReclaim<T>,
 {
     #[inline]
-    fn take_segm_ref(&mut self, length: usize) -> impl TrBuffSegmRef<T> {
+    fn take_segm_ref<'a>(
+        &'a mut self,
+        length: &impl RangeBounds<usize>,
+    ) -> impl 'a + Try<Output: 'a + TrBuffSegmRef<T>> {
         SegmRef::take_segm_ref(self, length)
     }
 }
 
 #[cfg(test)]
 mod tests_ {
+    use core::ptr::NonNull;
+
+    use crate::SegmSelfReclaim;
+
     use super::SegmRef;
 
     #[test]
@@ -184,25 +211,46 @@ mod tests_ {
         for (u, x) in buff.iter_mut().enumerate() {
             *x = u
         }
-        let mut segm = SegmRef::no_reclaim(buff.as_slice());
+        let mut segm = SegmRef::new(buff.as_mut_slice(), Option::<SegmSelfReclaim>::None);
+        segm.reclaim_ = Option::Some(unsafe {
+            let offset_ptr = NonNull::new_unchecked(&mut segm.offset_ as *mut usize);
+            SegmSelfReclaim::new(offset_ptr)
+        });
         let slice = segm.as_slice();
         assert_eq!(segm.len(), ARR_SIZE);
-        assert_eq!(slice.len(), buff.len());
+        assert_eq!(slice.len(), ARR_SIZE);
 
         const SLICE_LEN: usize = ARR_SIZE >> 1;
-        let taken_slice = segm.take_segm_ref(SLICE_LEN);
-        for (u, x) in taken_slice.as_ref().iter().enumerate() {
-            assert_eq!(*x, u)
-        }
-        drop(taken_slice);
-        assert_eq!(segm.len(), buff.len() - SLICE_LEN);
+        if true {
+            let first_range = ..SLICE_LEN;
+            let first_take = segm.take_segm_ref(&first_range);
 
-        let taken_slice = segm.take_segm_ref(ARR_SIZE);
-        assert_eq!(taken_slice.len(), buff.len() - SLICE_LEN);
-        for (u, x) in taken_slice.as_ref().iter().enumerate() {
-            assert_eq!(*x, u + SLICE_LEN)
+            std::println!("segm_ref first_take");
+
+            if let Option::Some(taken_slice) = &first_take {
+                assert_eq!(taken_slice.as_slice().len(), SLICE_LEN);
+                for (u, x) in taken_slice.as_slice().iter().enumerate() {
+                    assert_eq!(*x, u)
+                }
+            } else {
+                panic!("first_take failed")
+            }
         }
-        drop(taken_slice);
+        assert_eq!(segm.as_slice().len(), ARR_SIZE - SLICE_LEN);
+        if true {
+            let second_range = ..ARR_SIZE;
+            let second_take = segm.take_segm_ref(&second_range);
+
+            std::println!("segm_ref second_take");
+
+            if let Option::Some(taken_slice) = &second_take {
+                assert_eq!(taken_slice.len(), ARR_SIZE - SLICE_LEN);
+                for (u, x) in taken_slice.as_ref().iter().enumerate() {
+                    assert_eq!(*x, u + SLICE_LEN)
+                }
+            }
+        }
         assert_eq!(segm.len(), 0);
+        std::println!("segm_ref test succ");
     }
 }
